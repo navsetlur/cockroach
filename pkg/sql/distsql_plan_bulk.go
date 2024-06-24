@@ -176,19 +176,15 @@ func ReplanOnChangedFraction(thresholdFn func() float64) PlanChangeDecision {
 	}
 }
 
-// PlanDeltaFn describes a function that measures the difference of two physical
-// plans as a scalar.
-type PlanDeltaFn func(*PhysicalPlan, *PhysicalPlan) float64
+// countNodesFn counts the source and dest nodes in a Physical Plan
+type countNodesFn func(plan *PhysicalPlan) (src, dst map[string]struct{}, nodeCount int)
 
 // ReplanOnCustomFunc returns a PlanChangeDecision that returns true when a new
 // plan is sufficiently different than the previous plan. This occurs if the
 // measureChangeFn returns a scalar higher than the thresholdFn.
 //
 // If the thresholdFn returns 0.0, a new plan is never chosen.
-func ReplanOnCustomFunc(
-	getNodes func(plan *PhysicalPlan) (src, dst map[string]struct{}, nodeCount int),
-	thresholdFn func() float64,
-) PlanChangeDecision {
+func ReplanOnCustomFunc(getNodes countNodesFn, thresholdFn func() float64) PlanChangeDecision {
 	return func(ctx context.Context, oldPlan, newPlan *PhysicalPlan) bool {
 		threshold := thresholdFn()
 		if threshold == 0.0 {
