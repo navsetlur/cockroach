@@ -176,7 +176,7 @@ func TestLDRBasic(ctx context.Context, t test.Test, c cluster.Cluster, setup mul
 		tableName: "kv",
 	}
 
-	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload)
+	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload, true)
 
 	// Setup latency verifiers
 	maxExpectedLatency := 2 * time.Minute
@@ -240,7 +240,7 @@ func TestLDRUpdateHeavy(
 		tableName: "usertable",
 	}
 
-	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload)
+	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload, true)
 
 	// Setup latency verifiers
 	maxExpectedLatency := 3 * time.Minute
@@ -304,7 +304,16 @@ func TestLDROnNodeShutdown(
 		tableName: "kv",
 	}
 
-	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload)
+	var (
+		leftJobID, rightJobID int
+	)
+
+	rng, _ := randutil.NewPseudoRand()
+	if rng.Intn(2) == 0 {
+		leftJobID, rightJobID = setupLDR(ctx, t, c, setup, ldrWorkload, true)
+	} else {
+		leftJobID, rightJobID = setupLDR(ctx, t, c, setup, ldrWorkload, false)
+	}
 
 	// Setup latency verifiers, remembering to account for latency spike from killing a node
 	maxExpectedLatency := 5 * time.Minute
@@ -340,16 +349,13 @@ func TestLDROnNodeShutdown(
 		return c.RunE(ctx, option.WithNodes(setup.workloadNode), ldrWorkload.workload.sourceRunCmd("system", setup.CRDBNodes()))
 	})
 
-	// Let workload run for a bit before we kill a node
-	time.Sleep(ldrWorkload.workload.(replicateKV).debugRunDuration / 10)
+	// Let workload run for a bit before killing a node
+	sleepDuration := (time.Minute * time.Duration(rng.Intn(int(duration)))) / 20
+	time.Sleep(sleepDuration)
 
+	// Any node should be killable, including the coordinator
 	findNodeToStop := func(info *clusterInfo, rng *rand.Rand) int {
-		for {
-			anotherNode := info.nodes.SeededRandNode(rng)[0]
-			if anotherNode != info.gatewayNodes[0] {
-				return anotherNode
-			}
-		}
+		return info.nodes.SeededRandNode(rng)[0]
 	}
 
 	t.L().Printf("Finding node to stop Left")
@@ -357,18 +363,27 @@ func TestLDROnNodeShutdown(
 	t.L().Printf("Finding node to stop right")
 	nodeToStopR := findNodeToStop(setup.right, setup.rng)
 
-	// Graceful shutdown on both nodes
-	// TODO(naveen.setlur): maybe switch this to a less graceful shutdown via SIGKILL
-	stopOpts := option.NewStopOpts(option.Graceful(shutdownGracePeriod))
+	getStopOpts := func() option.StopOpts {
+		if rng.Intn(2) == 0 {
+			// Graceful stop
+			return option.NewStopOpts(option.Graceful(shutdownGracePeriod))
+		}
+		// Standard SIGKILL
+		return option.DefaultStopOpts()
+	}
+
 	t.L().Printf("Shutting down node-left: %d", nodeToStopL)
 	monitor.ExpectDeath()
-	if err := c.StopE(ctx, t.L(), stopOpts, c.Node(nodeToStopL)); err != nil {
+	if err := c.StopE(ctx, t.L(), getStopOpts(), c.Node(nodeToStopL)); err != nil {
 		t.Fatalf("Unable to shutdown node: %s", err)
 	}
 
+	// Sleep to stagger shutdown
+	time.Sleep(ldrWorkload.workload.(replicateKV).debugRunDuration / 20)
+
 	t.L().Printf("Shutting down node-right: %d", nodeToStopR)
 	monitor.ExpectDeath()
-	if err := c.StopE(ctx, t.L(), stopOpts, c.Node(nodeToStopR)); err != nil {
+	if err := c.StopE(ctx, t.L(), getStopOpts(), c.Node(nodeToStopR)); err != nil {
 		t.Fatalf("Unable to shutdown node: %s", err)
 	}
 
@@ -399,7 +414,7 @@ func TestLDROnNetworkPartition(
 		tableName: "kv",
 	}
 
-	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload)
+	leftJobID, rightJobID := setupLDR(ctx, t, c, setup, ldrWorkload, true)
 
 	monitor := c.NewMonitor(ctx, setup.CRDBNodes())
 	monitor.Go(func(ctx context.Context) error {
@@ -578,6 +593,7 @@ func setupLDR(
 	c cluster.Cluster,
 	setup multiClusterSetup,
 	ldrWorkload LDRWorkload,
+	waitForInitialScan bool,
 ) (int, int) {
 	c.Run(ctx,
 		option.WithNodes(setup.workloadNode),
@@ -607,12 +623,14 @@ func setupLDR(
 	leftJobID := startLDR(setup.left.sysSQL, setup.right.PgURLForDatabase(dbName))
 	rightJobID := startLDR(setup.right.sysSQL, setup.left.PgURLForDatabase(dbName))
 
-	// TODO(ssd): We wait for the replicated time to
-	// avoid starting the workload here until we
-	// have the behaviour around initial scans
-	// sorted out.
-	waitForReplicatedTime(t, leftJobID, setup.left.db, getLogicalDataReplicationJobInfo, 2*time.Minute)
-	waitForReplicatedTime(t, rightJobID, setup.right.db, getLogicalDataReplicationJobInfo, 2*time.Minute)
+	if waitForInitialScan {
+		// TODO(ssd): We wait for the replicated time to
+		// avoid starting the workload here until we
+		// have the behaviour around initial scans
+		// sorted out.
+		waitForReplicatedTime(t, leftJobID, setup.left.db, getLogicalDataReplicationJobInfo, 2*time.Minute)
+		waitForReplicatedTime(t, rightJobID, setup.right.db, getLogicalDataReplicationJobInfo, 2*time.Minute)
+	}
 
 	t.L().Printf("LDR Setup complete")
 	return leftJobID, rightJobID
